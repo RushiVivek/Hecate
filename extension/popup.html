@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font: 13px system-ui, sans-serif;
+        width: 320px;
+        margin: 0;
+        padding: 10px;
+      }
+      button {
+        font: inherit;
+        padding: 4px 10px;
+        cursor: pointer;
+      }
+      #status {
+        color: #888;
+        margin: 6px 0;
+      }
+      ul {
+        list-style: none;
+        margin: 6px 0 0;
+        padding: 0;
+      }
+      li {
+        padding: 4px 0;
+        border-top: 1px solid #eee;
+      }
+      li a {
+        text-decoration: none;
+        color: #1a56db;
+      }
+      li .url {
+        display: block;
+        color: #999;
+        font-size: 11px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="refresh">List bookmarks</button>
+    <div id="status"></div>
+    <ul id="list"></ul>
+    <script src="popup.js"></script>
+  </body>
+</html>

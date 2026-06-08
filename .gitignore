@@ -1,0 +1,7 @@
+# Rust build artifacts
+native/target/
+
+# Local extension signing key — NEVER commit. Whoever holds this can publish
+# an extension that impersonates hecate's stable ID. Back it up out-of-band.
+install/hecate-extension-key.pem
+*.pem
