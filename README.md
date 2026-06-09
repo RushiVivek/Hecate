@@ -6,31 +6,53 @@ bookmark store and all crypto; a thin **WebExtension** talks to it over
 Both Chromium- and Firefox-family browsers point at the same native app, so
 they share one store — sync without a server.
 
-> Status: **v1 thin vertical slice.** Native app (Rust + SQLite) + Chromium
-> extension + native-messaging wiring, doing one op end-to-end (`list`/`add`).
-> Hidden encrypted folders, folder nesting, and Firefox come next.
+> Status: **Milestone 2 — folder tree + CRUD.** Nested folders/bookmarks with
+> full CRUD over native messaging + CLI; the extension overrides
+> `chrome://bookmarks` with hecate's own tree UI, and adds bookmarks via the
+> popup, a right-click menu, and a keyboard shortcut. Hidden encrypted folders,
+> Firefox wiring, and native-bookmark-bar mirroring come next.
 
 ## Layout
 
 ```
 native/      Rust binary: bookmark store + native-messaging host
-extension/   Chromium MV3 WebExtension (thin client)
+extension/   Chromium MV3 WebExtension (popup + chrome://bookmarks override)
 install/     installer that registers the native-messaging host manifest
 ```
 
 ## Native binary
 
+The store is a single SQLite file: one `nodes` table holding folders and
+bookmarks in a tree (a single root, `parent_id` links, per-folder ordering).
+The native app is the sole source of truth and enforces all tree invariants
+(no cycles, atomic recursive delete, contiguous ordering) inside transactions.
+
 ```
-cargo build            # from native/
-hecate init            # create the store (~/.local/share/hecate/hecate.db)
-hecate add <title> <url>
-hecate list
-hecate serve           # native-messaging loop (spoken by the extension)
+cargo build                          # from native/
+hecate init                          # create/migrate (~/.local/share/hecate/hecate.db)
+hecate tree                          # print the folder tree
+hecate list                          # flat list of bookmarks
+hecate add   <title> <url> [--parent ID]
+hecate mkdir <title> [--parent ID]
+hecate rename <id> <title>
+hecate move  <id> <new_parent> [--pos N]
+hecate rm    <id>                    # folders delete recursively
+hecate serve                         # native-messaging loop (used by the extension)
 ```
 
-The store is a single SQLite file. `serve` reads length-prefixed JSON requests
-on stdin and writes JSON replies on stdout per Chrome's native-messaging
-protocol.
+`serve` reads length-prefixed JSON requests on stdin and writes JSON replies on
+stdout per Chrome's native-messaging protocol. Each request is its own process;
+the store uses WAL + `BEGIN IMMEDIATE` so concurrent browsers stay safe.
+
+## Extension UI
+
+- **`chrome://bookmarks`** is overridden with hecate's tree manager (expand/
+  collapse, create/rename/move/delete). If the native host is unreachable it
+  shows a banner with remediation rather than a blank page.
+- **Toolbar popup** — "Add this page" with a destination-folder picker.
+- **Right-click menu** — "Bookmark with hecate" on pages and links.
+- **Keyboard** — `Ctrl+Shift+D` (`Cmd+Shift+D` on mac) bookmarks the current
+  page; rebind at `chrome://extensions/shortcuts`.
 
 ## Install (Chromium family)
 

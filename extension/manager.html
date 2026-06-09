@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>hecate</title>
+    <style>
+      :root {
+        --fg: #1a1a1a;
+        --muted: #888;
+        --accent: #1a56db;
+        --border: #e3e3e3;
+        --hover: #f3f4f6;
+      }
+      * { box-sizing: border-box; }
+      body {
+        font: 14px system-ui, sans-serif;
+        color: var(--fg);
+        margin: 0;
+        padding: 0;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 18px;
+        border-bottom: 1px solid var(--border);
+        position: sticky;
+        top: 0;
+        background: #fff;
+        z-index: 2;
+      }
+      header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+      header .spacer { flex: 1; }
+      button {
+        font: inherit;
+        padding: 5px 10px;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        background: #fff;
+        cursor: pointer;
+      }
+      button:hover { background: var(--hover); }
+      #banner {
+        display: none;
+        padding: 10px 18px;
+        background: #fff3cd;
+        border-bottom: 1px solid #ffe69c;
+        color: #664d03;
+      }
+      #banner code {
+        background: #00000010;
+        padding: 1px 5px;
+        border-radius: 3px;
+      }
+      main { padding: 12px 18px; }
+      ul.tree { list-style: none; margin: 0; padding: 0; }
+      ul.tree ul { list-style: none; margin: 0; padding-left: 20px; }
+      li.node { padding: 1px 0; }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 6px;
+        border-radius: 5px;
+      }
+      .row:hover { background: var(--hover); }
+      .row:hover .actions { visibility: visible; }
+      .twisty {
+        width: 14px;
+        text-align: center;
+        color: var(--muted);
+        cursor: pointer;
+        user-select: none;
+      }
+      .twisty.leaf { visibility: hidden; }
+      .icon { width: 16px; text-align: center; }
+      .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .label a { color: var(--accent); text-decoration: none; }
+      .label a:hover { text-decoration: underline; }
+      .actions { visibility: hidden; display: flex; gap: 4px; }
+      .actions button { padding: 1px 7px; font-size: 12px; }
+      .empty { color: var(--muted); padding: 8px 6px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>hecate</h1>
+      <div class="spacer"></div>
+      <button id="new-folder">New folder</button>
+      <button id="refresh">Refresh</button>
+    </header>
+    <div id="banner"></div>
+    <main>
+      <ul id="tree" class="tree"></ul>
+    </main>
+    <script src="manager.js"></script>
+  </body>
+</html>
