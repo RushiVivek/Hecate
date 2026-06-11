@@ -8,7 +8,7 @@
 use std::io::{self, Read, Write};
 
 /// Chrome's cap on a single host→browser message.
-const MAX_OUTGOING: usize = 1024 * 1024;
+pub const MAX_OUTGOING: usize = 1024 * 1024;
 /// Defensive cap on incoming length so a corrupt prefix can't make us eagerly
 /// allocate a huge buffer. Chrome allows up to 4 GB inbound, but hecate requests
 /// are tiny JSON objects — 4 MB is already absurdly generous and bounds a bad

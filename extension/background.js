@@ -13,12 +13,26 @@ const HOST = "com.rushivivek.hecate";
 const ALLOWED_OPS = new Set([
   "tree",
   "list",
+  "children",
+  "search",
   "add",
   "create_folder",
   "create_bookmark",
   "rename",
   "move",
   "delete",
+  // Hidden vault. The key (when present) is just relayed opaquely; the host
+  // does all crypto. vault_unlock/vault_create take a phrase, not a key.
+  "vault_status",
+  "vault_create",
+  "vault_unlock",
+  "vault_children",
+  "vault_create_folder",
+  "vault_create_bookmark",
+  "vault_rename",
+  "vault_move",
+  "vault_delete",
+  "vault_change_phrase",
 ]);
 
 const CONTEXT_MENU_ID = "hecate-add";

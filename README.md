@@ -6,11 +6,11 @@ bookmark store and all crypto; a thin **WebExtension** talks to it over
 Both Chromium- and Firefox-family browsers point at the same native app, so
 they share one store — sync without a server.
 
-> Status: **Milestone 2 — folder tree + CRUD.** Nested folders/bookmarks with
-> full CRUD over native messaging + CLI; the extension overrides
-> `chrome://bookmarks` with hecate's own tree UI, and adds bookmarks via the
-> popup, a right-click menu, and a keyboard shortcut. Hidden encrypted folders,
-> Firefox wiring, and native-bookmark-bar mirroring come next.
+> Status: **Milestone 3 — hidden encrypted vault + pagination + drag-and-drop.**
+> On top of the M2 folder tree: a single encrypted hidden vault (the marquee
+> feature), folders that lazy-load a page at a time, full-text search, and
+> drag-and-drop in the manager. Firefox wiring and native-bookmark-bar
+> mirroring come next.
 
 ## Layout
 
@@ -37,18 +37,59 @@ hecate mkdir <title> [--parent ID]
 hecate rename <id> <title>
 hecate move  <id> <new_parent> [--pos N]
 hecate rm    <id>                    # folders delete recursively
+hecate children [--parent ID] [--limit N] [--offset N]   one page of children
 hecate serve                         # native-messaging loop (used by the extension)
+
+# hidden vault — phrase is read from stdin, never argv
+echo "<phrase>" | hecate vault-create
+echo "<phrase>" | hecate vault-tree
+echo "<phrase>" | hecate vault-mkdir <title> [--parent ID]
+echo "<phrase>" | hecate vault-add <title> <url> [--parent ID]
 ```
 
 `serve` reads length-prefixed JSON requests on stdin and writes JSON replies on
 stdout per Chrome's native-messaging protocol. Each request is its own process;
 the store uses WAL + `BEGIN IMMEDIATE` so concurrent browsers stay safe.
 
+## Hidden encrypted vault
+
+A single hidden vault holds an arbitrarily-nested secret subtree, encrypted at
+rest and **physically absent from the normal `nodes` tree** (it lives in a
+separate `vault` table as one opaque AEAD blob — it can never leak into the
+visible tree or a future bookmark-bar mirror).
+
+- **Model "b": the phrase IS the key.** A passphrase → Argon2id (with a stored,
+  cleartext salt + params) → 32-byte key; the subtree is sealed with
+  XChaCha20-Poly1305. Nothing that can recover the data is stored — no key, no
+  verifier.
+- **Reveal:** type the phrase into the manager's search box. If it matches no
+  bookmarks it's tried as a vault phrase; success reveals a "🔒 Hidden" branch
+  for the page session. Wrong phrase shows "no matches" — no oracle.
+
+**Honest caveats (by design):**
+
+- Forget the phrase → the vault is **unrecoverable**. No escrow.
+- It is **offline-brute-forceable**: anyone with the disk has the salt, params,
+  and ciphertext — a complete offline verifier. The only defense is **phrase
+  entropy** × Argon2id cost (tuned to ~hundreds of ms). Use a real high-entropy
+  passphrase, not a password.
+- The derived key is returned to the manager page and held in **browser JS
+  memory** for the unlocked session (a deliberate simplicity tradeoff over a
+  key-holding daemon). So a live attacker on the unlocked page can read the key
+  and plaintext; the locks (manual, 5-min idle, page-close) are best-effort.
+  The protection this *does* deliver is **at rest**: a stolen disk / copied DB /
+  backup reveals nothing without the phrase.
+
 ## Extension UI
 
-- **`chrome://bookmarks`** is overridden with hecate's tree manager (expand/
-  collapse, create/rename/move/delete). If the native host is unreachable it
-  shows a banner with remediation rather than a blank page.
+- **`chrome://bookmarks`** is overridden with hecate's tree manager. Folders
+  **lazy-load one page at a time** (so a huge tree stays responsive and no
+  reply approaches the native-messaging 1 MB cap). Create/rename/move/delete,
+  plus **drag-and-drop**: drag a URL onto a folder to add it, drag items between
+  folders to move, drop between siblings to reorder. A "Move to…" button stays
+  as a keyboard-accessible fallback. If the host is unreachable it shows a
+  banner, never a blank page.
+- **Search box** filters the tree; doubles as the vault reveal (see above).
 - **Toolbar popup** — "Add this page" with a destination-folder picker.
 - **Right-click menu** — "Bookmark with hecate" on pages and links.
 - **Keyboard** — `Ctrl+Shift+D` (`Cmd+Shift+D` on mac) bookmarks the current

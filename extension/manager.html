@@ -80,12 +80,35 @@
       .actions { visibility: hidden; display: flex; gap: 4px; }
       .actions button { padding: 1px 7px; font-size: 12px; }
       .empty { color: var(--muted); padding: 8px 6px; }
+      #search {
+        font: inherit;
+        padding: 5px 9px;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        width: 260px;
+      }
+      /* Drag-and-drop affordances. */
+      .row[draggable="true"] { cursor: grab; }
+      .row.drop-into { background: #dbeafe; outline: 1px solid var(--accent); }
+      .row.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+      .row.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+      /* The hidden-vault branch is visually distinct. */
+      li.vault-root > .row { color: #6d28d9; font-weight: 600; }
+      #lock-btn { display: none; }
+      .vault-on #lock-btn { display: inline-block; }
     </style>
   </head>
   <body>
     <header>
       <h1>hecate</h1>
+      <input
+        id="search"
+        type="search"
+        placeholder="Search… (or type a phrase to reveal hidden)"
+        autocomplete="off"
+      />
       <div class="spacer"></div>
+      <button id="lock-btn" title="Lock the hidden vault">🔒 Lock</button>
       <button id="new-folder">New folder</button>
       <button id="refresh">Refresh</button>
     </header>

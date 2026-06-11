@@ -14,6 +14,7 @@
 
 mod nm;
 mod store;
+mod vault;
 
 use std::io;
 use std::process::ExitCode;
@@ -59,6 +60,76 @@ enum Request {
     Delete {
         id: i64,
     },
+    /// Paginated direct children of a folder (default root).
+    Children {
+        parent_id: Option<i64>,
+        #[serde(default = "default_limit")]
+        limit: i64,
+        #[serde(default)]
+        offset: i64,
+    },
+    /// Flat substring search over the visible tree.
+    Search {
+        query: String,
+        #[serde(default = "default_limit")]
+        limit: i64,
+    },
+
+    // --- hidden vault ops -------------------------------------------------
+    /// Does a hidden vault exist on disk?
+    VaultStatus,
+    /// Create a new empty vault. Returns the wire key.
+    VaultCreate { phrase: String },
+    /// Unlock with a phrase. Returns the wire key + the vault's top-level page.
+    VaultUnlock {
+        phrase: String,
+        #[serde(default = "default_limit")]
+        limit: i64,
+        #[serde(default)]
+        offset: i64,
+    },
+    /// Paginated children inside the (already-unlocked) vault, by wire key.
+    VaultChildren {
+        key: String,
+        parent_id: Option<i64>,
+        #[serde(default = "default_limit")]
+        limit: i64,
+        #[serde(default)]
+        offset: i64,
+    },
+    VaultCreateFolder {
+        key: String,
+        parent_id: Option<i64>,
+        title: String,
+    },
+    VaultCreateBookmark {
+        key: String,
+        parent_id: Option<i64>,
+        title: String,
+        url: String,
+    },
+    VaultRename {
+        key: String,
+        id: i64,
+        title: String,
+    },
+    VaultMove {
+        key: String,
+        id: i64,
+        new_parent_id: i64,
+        position: Option<i64>,
+    },
+    VaultDelete {
+        key: String,
+        id: i64,
+    },
+    /// Re-key the vault under a new phrase. Returns the new wire key.
+    VaultChangePhrase { key: String, new_phrase: String },
+}
+
+/// Default page size for paginated reads.
+fn default_limit() -> i64 {
+    200
 }
 
 fn main() -> ExitCode {
@@ -76,6 +147,14 @@ fn main() -> ExitCode {
         Some("rename") => cmd_rename(rest),
         Some("move") => cmd_move(rest),
         Some("rm") => cmd_rm(rest),
+        Some("children") => cmd_children(rest),
+        // Vault CLI parity — phrase is read from stdin, NEVER argv (argv leaks
+        // into ps/history). Useful for testing the vault without a browser.
+        Some("vault-status") => cmd_vault_status(),
+        Some("vault-create") => cmd_vault_create(),
+        Some("vault-tree") => cmd_vault_tree(),
+        Some("vault-mkdir") => cmd_vault_mkdir(rest),
+        Some("vault-add") => cmd_vault_add(rest),
         // When a browser launches us as a native-messaging host, the first
         // argument is the caller's origin (e.g. `chrome-extension://<id>/` or
         // `moz-extension://<uuid>/`), NOT a subcommand. Route those to serve.
@@ -112,7 +191,14 @@ fn usage() {
          mkdir <title> [--parent ID]         create a folder\n\
          rename <id> <title>                 rename a node\n\
          move  <id> <new_parent> [--pos N]   move/reorder a node\n\
-         rm    <id>                          delete a node (folders: recursive)"
+         rm    <id>                          delete a node (folders: recursive)\n\
+         children [--parent ID] [--limit N] [--offset N]   one page of a folder's children\n\
+         \n\
+         vault-status                        is there a hidden vault?\n\
+         vault-create                        create a vault (phrase on stdin)\n\
+         vault-tree                          print the vault tree (phrase on stdin)\n\
+         vault-mkdir <title> [--parent ID]   add a hidden folder (phrase on stdin)\n\
+         vault-add <title> <url> [--parent ID]   add a hidden bookmark (phrase on stdin)"
     );
 }
 
@@ -253,6 +339,101 @@ fn cmd_rm(rest: &[String]) -> anyhow_lite::Result {
     Ok(())
 }
 
+fn cmd_children(rest: &[String]) -> anyhow_lite::Result {
+    let (parent, _) = take_flag(rest, "--parent")?;
+    let (limit, r2) = take_flag(rest, "--limit")?;
+    let (offset, _) = take_flag(&r2, "--offset")?;
+    let store = Store::open()?;
+    let (page, total) = store.children(parent, limit.unwrap_or(200), offset.unwrap_or(0))?;
+    println!("total {total}");
+    for n in &page {
+        print_flat(n);
+    }
+    Ok(())
+}
+
+/// Read a secret phrase from stdin (never argv). Trims the trailing newline.
+fn read_phrase() -> Result<String, anyhow_lite::Error> {
+    use std::io::Read;
+    let mut s = String::new();
+    io::stdin().read_to_string(&mut s)?;
+    let s = s.trim_end_matches(['\n', '\r']).to_string();
+    if s.is_empty() {
+        return Err("empty phrase on stdin".into());
+    }
+    Ok(s)
+}
+
+fn cmd_vault_status() -> anyhow_lite::Result {
+    let store = Store::open()?;
+    println!("{}", if vault::exists(store.conn())? { "exists" } else { "none" });
+    Ok(())
+}
+
+fn cmd_vault_create() -> anyhow_lite::Result {
+    let phrase = read_phrase()?;
+    let store = Store::open()?;
+    vault::create(store.conn(), &phrase)?;
+    println!("vault created");
+    Ok(())
+}
+
+fn cmd_vault_tree() -> anyhow_lite::Result {
+    let phrase = read_phrase()?;
+    let store = Store::open()?;
+    let unlocked = vault::unlock(store.conn(), &phrase)?;
+    let root = unlocked.store.tree(true)?;
+    print_node(&root, 0);
+    Ok(())
+}
+
+fn cmd_vault_mkdir(rest: &[String]) -> anyhow_lite::Result {
+    let (parent, pos) = take_flag(rest, "--parent")?;
+    let title = match pos.as_slice() {
+        [title] => title.clone(),
+        _ => return Err("usage: hecate vault-mkdir <title> [--parent ID]  (phrase on stdin)".into()),
+    };
+    let phrase = read_phrase()?;
+    let store = Store::open()?;
+    let unlocked = vault::unlock(store.conn(), &phrase)?;
+    let now = now_secs();
+    let id = vault::with_vault_mut(store.conn(), &unlocked.key_b64, |s| {
+        s.create_folder(parent, &title, now)
+    })?;
+    println!("created folder {id}");
+    Ok(())
+}
+
+fn cmd_vault_add(rest: &[String]) -> anyhow_lite::Result {
+    let (parent, pos) = take_flag(rest, "--parent")?;
+    let (title, url) = match pos.as_slice() {
+        [title, url] => (title.clone(), url.clone()),
+        _ => return Err("usage: hecate vault-add <title> <url> [--parent ID]  (phrase on stdin)".into()),
+    };
+    let phrase = read_phrase()?;
+    let store = Store::open()?;
+    let unlocked = vault::unlock(store.conn(), &phrase)?;
+    let now = now_secs();
+    let id = vault::with_vault_mut(store.conn(), &unlocked.key_b64, |s| {
+        s.create_bookmark(parent, &title, &url, now)
+    })?;
+    println!("added {id}");
+    Ok(())
+}
+
+fn print_flat(n: &Node) {
+    match n.kind {
+        NodeKind::Folder => println!("{} [{}] {}/", n.id, n.position, n.title),
+        NodeKind::Bookmark => println!(
+            "{} [{}] {} -> {}",
+            n.id,
+            n.position,
+            n.title,
+            n.url.as_deref().unwrap_or("")
+        ),
+    }
+}
+
 fn parse_id(s: &str) -> Result<i64, anyhow_lite::Error> {
     s.parse::<i64>().map_err(|_| format!("invalid id: {s}").into())
 }
@@ -267,7 +448,20 @@ fn serve() -> anyhow_lite::Result {
     while let Some(raw) = nm::read_message(&mut stdin)? {
         let response = handle(&store, &raw);
         let bytes = serde_json::to_vec(&response)?;
-        nm::write_message(&mut stdout, &bytes)?;
+        if bytes.len() > nm::MAX_OUTGOING {
+            // The reply is too big for one native-messaging frame. Don't let it
+            // tear down the whole serve loop (which would make the offending
+            // folder/vault permanently un-openable on every retry) — reply with
+            // a small structured error instead. Pages are byte-budgeted in the
+            // store, so this is a last-resort guard (e.g. one node whose own
+            // fields exceed the cap).
+            let small = serde_json::to_vec(
+                &json!({ "ok": false, "error": "reply too large for one message" }),
+            )?;
+            nm::write_message(&mut stdout, &small)?;
+        } else {
+            nm::write_message(&mut stdout, &bytes)?;
+        }
     }
     Ok(())
 }
@@ -312,11 +506,121 @@ fn handle(store: &Store, raw: &[u8]) -> Value {
             Ok(deleted) => json!({ "ok": true, "deleted": deleted }),
             Err(e) => err(e),
         },
+        Request::Children {
+            parent_id,
+            limit,
+            offset,
+        } => match store.children(parent_id, limit, offset) {
+            Ok((children, total)) => json!({ "ok": true, "children": children, "total": total }),
+            Err(e) => err(e),
+        },
+        Request::Search { query, limit } => match store.search(&query, limit) {
+            Ok(results) => json!({ "ok": true, "results": results }),
+            Err(e) => err(e),
+        },
+
+        // --- hidden vault ---------------------------------------------------
+        Request::VaultStatus => match vault::exists(store.conn()) {
+            Ok(exists) => json!({ "ok": true, "exists": exists }),
+            Err(e) => verr(e),
+        },
+        Request::VaultCreate { phrase } => match vault::create(store.conn(), &phrase) {
+            Ok(key) => json!({ "ok": true, "key": key }),
+            Err(e) => verr(e),
+        },
+        Request::VaultUnlock {
+            phrase,
+            limit,
+            offset,
+        } => match vault::unlock(store.conn(), &phrase) {
+            Ok(unlocked) => match unlocked.store.children(None, limit, offset) {
+                Ok((children, total)) => json!({
+                    "ok": true, "key": unlocked.key_b64,
+                    "children": children, "total": total,
+                }),
+                Err(e) => err(e),
+            },
+            Err(e) => verr(e),
+        },
+        Request::VaultChildren {
+            key,
+            parent_id,
+            limit,
+            offset,
+        } => match vault::open_with_key(store.conn(), &key) {
+            Ok(vstore) => match vstore.children(parent_id, limit, offset) {
+                Ok((children, total)) => {
+                    json!({ "ok": true, "children": children, "total": total })
+                }
+                Err(e) => err(e),
+            },
+            Err(e) => verr(e),
+        },
+        Request::VaultCreateFolder {
+            key,
+            parent_id,
+            title,
+        } => vid_result(vault::with_vault_mut(store.conn(), &key, |s| {
+            s.create_folder(parent_id, &title, now)
+        })),
+        Request::VaultCreateBookmark {
+            key,
+            parent_id,
+            title,
+            url,
+        } => vid_result(vault::with_vault_mut(store.conn(), &key, |s| {
+            s.create_bookmark(parent_id, &title, &url, now)
+        })),
+        Request::VaultRename { key, id, title } => {
+            vok_result(vault::with_vault_mut(store.conn(), &key, |s| {
+                s.rename(id, &title, now)
+            }))
+        }
+        Request::VaultMove {
+            key,
+            id,
+            new_parent_id,
+            position,
+        } => vok_result(vault::with_vault_mut(store.conn(), &key, |s| {
+            s.move_node(id, new_parent_id, position, now)
+        })),
+        Request::VaultDelete { key, id } => {
+            match vault::with_vault_mut(store.conn(), &key, |s| s.delete(id)) {
+                Ok(deleted) => json!({ "ok": true, "deleted": deleted }),
+                Err(e) => verr(e),
+            }
+        }
+        Request::VaultChangePhrase { key, new_phrase } => {
+            match vault::change_phrase(store.conn(), &key, &new_phrase) {
+                Ok(new_key) => json!({ "ok": true, "key": new_key }),
+                Err(e) => verr(e),
+            }
+        }
     }
 }
 
 fn err(e: store::StoreError) -> Value {
     json!({ "ok": false, "error": e.to_string() })
+}
+
+fn verr(e: vault::VaultError) -> Value {
+    json!({ "ok": false, "error": e.to_string() })
+}
+
+/// A vault mutation returning a new node id.
+fn vid_result(r: Result<i64, vault::VaultError>) -> Value {
+    match r {
+        Ok(id) => json!({ "ok": true, "id": id }),
+        Err(e) => verr(e),
+    }
+}
+
+/// A vault mutation returning nothing.
+fn vok_result(r: Result<(), vault::VaultError>) -> Value {
+    match r {
+        Ok(()) => json!({ "ok": true }),
+        Err(e) => verr(e),
+    }
 }
 
 fn id_result(r: Result<i64, store::StoreError>) -> Value {

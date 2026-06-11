@@ -5,8 +5,13 @@
 //! Folders and bookmarks live in one `nodes` table distinguished by `kind`.
 //! There is a single explicit root row (`parent_id IS NULL`) so the top level
 //! is just "children of root" and ordering/move/cycle-check/tree-read can treat
-//! it like any other folder. `hidden`/`enc_blob` columns are reserved for the
-//! later hidden-encrypted-folder milestone and are never populated here.
+//! it like any other folder. (The `hidden`/`enc_blob` columns are vestigial —
+//! reserved in an earlier milestone but never populated; hidden content now
+//! lives entirely in the separate encrypted `vault` table, see `vault.rs`.)
+//!
+//! The same `Store` engine backs two databases: the on-disk store, and an
+//! ephemeral in-memory copy of a decrypted hidden vault (`from_vault_rows`),
+//! which reuses every tree invariant (cycle/depth/reindex) for free.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -14,9 +19,15 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-const SCHEMA: &str = "
+/// Current on-disk schema version (PRAGMA user_version). v3 adds the `vault`
+/// table; v2 is the `nodes` tree; v1 was the flat `bookmarks` table.
+const SCHEMA_VERSION: i64 = 3;
+
+/// The `nodes` tree table + its index. Created standalone (no root seeded) so
+/// the vault's in-memory store can build the table and bulk-load its own rows.
+const NODES_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS nodes (
     id        INTEGER PRIMARY KEY,
     parent_id INTEGER REFERENCES nodes(id),
@@ -30,6 +41,21 @@ CREATE TABLE IF NOT EXISTS nodes (
     enc_blob  BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_parent_pos ON nodes(parent_id, position);
+";
+
+/// Singleton table holding the one encrypted hidden vault. No row exists until
+/// the user creates a vault. `kdf` is a cleartext PHC-style params+salt string
+/// (storing the salt/params is standard and consistent with "nothing stored" —
+/// there is no key or verifier on disk; security rests on phrase entropy).
+const VAULT_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS vault (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    kdf        TEXT NOT NULL,
+    nonce      BLOB NOT NULL,
+    ciphertext BLOB NOT NULL,
+    version    INTEGER NOT NULL,
+    updated    INTEGER NOT NULL
+);
 ";
 
 /// Maximum folder nesting depth (root = depth 0). The tree is serialized to
@@ -63,6 +89,9 @@ pub enum StoreError {
     MaxDepthExceeded,
     /// The store is structurally invalid (e.g. the singleton root is missing).
     CorruptStore(&'static str),
+    /// A decrypted vault blob is structurally invalid; refuse to persist it
+    /// (would otherwise overwrite recoverable data with a corrupt rewrite).
+    CorruptVault(&'static str),
 }
 
 impl fmt::Display for StoreError {
@@ -85,6 +114,7 @@ impl fmt::Display for StoreError {
                 write!(f, "maximum folder nesting depth ({MAX_DEPTH}) exceeded")
             }
             StoreError::CorruptStore(what) => write!(f, "corrupt store: {what}"),
+            StoreError::CorruptVault(what) => write!(f, "corrupt vault: {what}"),
         }
     }
 }
@@ -104,11 +134,26 @@ impl From<rusqlite::Error> for StoreError {
 }
 
 /// Folder vs bookmark.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeKind {
     Folder,
     Bookmark,
+}
+
+/// A flat node row — the serialization unit for a hidden vault's plaintext.
+/// Unlike `Node` (the nested display shape), this carries every column with no
+/// omissions, so a vault round-trips byte-for-byte through JSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeRow {
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub kind: NodeKind,
+    pub title: String,
+    pub url: Option<String>,
+    pub position: i64,
+    pub created: i64,
+    pub modified: i64,
 }
 
 /// One tree node, as returned to callers. `children` is populated only by
@@ -130,6 +175,7 @@ pub struct Node {
 }
 
 /// Handle to the open store.
+#[derive(Debug)]
 pub struct Store {
     conn: Connection,
 }
@@ -217,6 +263,191 @@ impl Store {
              ORDER BY created DESC, id DESC",
         )?;
         let rows = stmt.query_map([], row_to_node)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// One page of a folder's direct children, ordered by `(position, id)`,
+    /// plus the total child count. `parent_id` defaults to root. This is the
+    /// paginated read that lets the extension lazy-load each folder. The page is
+    /// bounded both by item count (the `limit`) AND by serialized bytes (see
+    /// `trim_to_byte_budget`) so a folder of fat nodes can't produce a reply
+    /// that exceeds the native-messaging cap and tears down the serve loop.
+    /// `total` is always the true child count, so the client's "show more"
+    /// paging advances even when a page was byte-trimmed. `children` here are
+    /// flat (no nested grandchildren).
+    pub fn children(
+        &self,
+        parent_id: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Node>, i64), StoreError> {
+        let parent = resolve_parent(&self.conn, parent_id)?;
+        ensure_folder(&self.conn, parent)?;
+        let total: i64 = self.conn.query_row(
+            "SELECT count(*) FROM nodes WHERE parent_id = ?1",
+            [parent],
+            |r| r.get(0),
+        )?;
+        // Clamp limit to a sane band so a bad client can't ask for a giant page.
+        let limit = limit.clamp(1, 1000);
+        let offset = offset.max(0);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, parent_id, kind, title, url, position, created, modified
+             FROM nodes WHERE parent_id = ?1
+             ORDER BY position, id
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map((parent, limit, offset), row_to_node)?;
+        let page = trim_to_byte_budget(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        Ok((page, total))
+    }
+
+    /// Flat substring search over bookmark/folder titles and bookmark URLs,
+    /// newest-first, capped. Powers the manager's search box. `query` is matched
+    /// case-insensitively as a literal substring (LIKE wildcards in the query
+    /// are escaped so a user typing `%` searches for a literal percent). The
+    /// root row is excluded.
+    pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Node>, StoreError> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{}%", escape_like(q));
+        let limit = limit.clamp(1, 1000);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, parent_id, kind, title, url, position, created, modified
+             FROM nodes
+             WHERE parent_id IS NOT NULL
+               AND (title LIKE ?1 ESCAPE '\\' OR (url IS NOT NULL AND url LIKE ?1 ESCAPE '\\'))
+             ORDER BY created DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map((pattern, limit), row_to_node)?;
+        Ok(trim_to_byte_budget(rows.collect::<rusqlite::Result<Vec<_>>>()?))
+    }
+
+    /// Borrow the underlying connection (the vault module drives crypto-aware
+    /// transactions against the same on-disk database through it).
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Consume the store and return its connection (used by vault tests that
+    /// want a fully-migrated connection without holding the `Store` wrapper).
+    #[cfg(test)]
+    pub fn into_conn(self) -> Connection {
+        self.conn
+    }
+
+    /// Build an ephemeral in-memory store from a decrypted vault's flat row set,
+    /// reusing the whole tree-CRUD engine (cycle/depth/reindex invariants) for
+    /// the hidden subtree. The rows MUST include the vault's own root row
+    /// (`parent_id IS NULL`); no root is auto-seeded here.
+    ///
+    /// The blob is untrusted on read (a phrase-holder or host bug could produce
+    /// a structurally-bad one), so after loading we validate: a single root,
+    /// every node reachable from it (no dangling parents / orphan cycles), and
+    /// depth within the cap. A corrupt blob is rejected as `CorruptVault` rather
+    /// than silently dropping nodes — otherwise the next re-encrypt would
+    /// persist the data loss.
+    pub fn from_vault_rows(conn: Connection, rows: &[NodeRow]) -> Result<Self, StoreError> {
+        conn.execute_batch(NODES_SCHEMA)?;
+        // Stamp the version so a stray migrate() on this connection is a no-op
+        // and never seeds a second root.
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        // Disable FK enforcement for the bulk load so corruption surfaces as our
+        // own typed `CorruptVault` (via the roots-count + reachability checks
+        // below) rather than a generic SQLite FK error — deterministic
+        // regardless of the build's default_foreign_keys setting. The vault's
+        // tree invariants (cycle/depth/reindex) are enforced in app code, not
+        // by FKs, so this doesn't weaken later mutations.
+        conn.pragma_update(None, "foreign_keys", false)?;
+        {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let mut roots = 0;
+            for r in rows {
+                if r.parent_id.is_none() {
+                    roots += 1;
+                    // The root must be a folder — every write path enforces this
+                    // via ensure_folder, so a bookmark-root means a corrupt blob.
+                    if r.kind != NodeKind::Folder {
+                        return Err(StoreError::CorruptVault("vault root must be a folder"));
+                    }
+                }
+                let kind = match r.kind {
+                    NodeKind::Folder => "folder",
+                    NodeKind::Bookmark => "bookmark",
+                };
+                tx.execute(
+                    "INSERT INTO nodes (id, parent_id, kind, title, url, position, created, modified, hidden)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                    (
+                        r.id,
+                        r.parent_id,
+                        kind,
+                        &r.title,
+                        &r.url,
+                        r.position,
+                        r.created,
+                        r.modified,
+                    ),
+                )
+                .map_err(dup_id_is_corrupt)?;
+            }
+            if roots != 1 {
+                return Err(StoreError::CorruptVault("vault must have exactly one root"));
+            }
+            tx.commit()?;
+        }
+        let store = Self { conn };
+        // Reachability + depth validation: tree() walks from the root applying
+        // check_depth and the cycle guards. A bad structure here means the
+        // decrypted blob is corrupt (only a phrase-holder or a host bug can
+        // reach this) — normalize EVERY structural failure to CorruptVault so
+        // the caller treats it uniformly and never re-encrypts/persists it
+        // (which would destroy recoverable data). tree() returning e.g.
+        // MaxDepthExceeded or CorruptStore("root missing") becomes CorruptVault.
+        let tree = match store.tree(true) {
+            Ok(t) => t,
+            Err(StoreError::Sqlite(e)) => return Err(StoreError::Sqlite(e)),
+            Err(_) => return Err(StoreError::CorruptVault("vault tree is structurally invalid")),
+        };
+        let reachable = count_nodes(&tree);
+        if reachable != rows.len() {
+            return Err(StoreError::CorruptVault(
+                "vault has unreachable nodes (dangling parent or orphan cycle)",
+            ));
+        }
+        Ok(store)
+    }
+
+    /// Dump every node as a flat row set (for re-encrypting a vault). Ordered by
+    /// id for a deterministic blob.
+    pub fn dump_rows(&self) -> Result<Vec<NodeRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, parent_id, kind, title, url, position, created, modified
+             FROM nodes ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let kind_str: String = r.get(2)?;
+            Ok(NodeRow {
+                id: r.get(0)?,
+                parent_id: r.get(1)?,
+                kind: if kind_str == "folder" {
+                    NodeKind::Folder
+                } else {
+                    NodeKind::Bookmark
+                },
+                title: r.get(3)?,
+                url: r.get(4)?,
+                position: r.get(5)?,
+                created: r.get(6)?,
+                modified: r.get(7)?,
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -472,6 +703,20 @@ fn assemble(
     built.remove(&root).expect("root present by construction")
 }
 
+/// Count every node in a nested tree (root included), iteratively. Used to
+/// verify a loaded vault has no unreachable rows.
+fn count_nodes(root: &Node) -> usize {
+    let mut n = 0;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        n += 1;
+        for child in &node.children {
+            stack.push(child);
+        }
+    }
+    n
+}
+
 /// Resolve an optional parent to a concrete id, defaulting to the root.
 fn resolve_parent(conn: &Connection, parent_id: Option<i64>) -> Result<i64, StoreError> {
     match parent_id {
@@ -627,6 +872,64 @@ fn collect_subtree_ids(conn: &Connection, id: i64) -> Result<Vec<i64>, StoreErro
     Ok(out)
 }
 
+/// Map a SQLite constraint violation (e.g. a duplicate `id` in a vault blob)
+/// to `CorruptVault`, leaving genuine I/O errors as `Sqlite`. Keeps every
+/// structural defect in a decrypted blob in the single uniform corrupt class.
+fn dup_id_is_corrupt(e: rusqlite::Error) -> StoreError {
+    match e {
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            StoreError::CorruptVault("duplicate node id in vault")
+        }
+        other => StoreError::Sqlite(other),
+    }
+}
+
+/// Trim a page so its serialized JSON stays under the native-messaging reply
+/// cap. Pagination caps by item *count* (limit≤1000), but titles/urls are
+/// unbounded, so a page of fat nodes can still blow Chrome's 1 MB cap and tear
+/// down the serve loop — leaving that folder permanently un-openable. Bound the
+/// page by actual serialized *bytes*: measure each node's real JSON length
+/// (`serde_json` escapes strings — a control byte becomes `\u00XX`, 6×, so a
+/// raw-length estimate is NOT a safe upper bound) and stop before the running
+/// size would exceed a budget that leaves headroom under the cap for the reply
+/// envelope. Always keep at least one node so the client's `loaded < total`
+/// paging still advances; a single node larger than the budget is the accepted,
+/// unavoidable "giant single node" case (handled by serve()'s oversize guard).
+fn trim_to_byte_budget(nodes: Vec<Node>) -> Vec<Node> {
+    // ~768 KiB leaves comfortable headroom under the 1 MiB cap for the wrapping
+    // `{"ok":true,"children":[...],"total":N}` envelope (and vault_unlock's
+    // extra `key` field) plus per-node comma separators.
+    const BUDGET: usize = 768 * 1024;
+    let mut total = 0usize;
+    let mut out = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        // Measure the ACTUAL serialized size (accounts for JSON string
+        // escaping). +1 for the comma joining it to the previous element.
+        let sz = serde_json::to_vec(&node).map(|v| v.len()).unwrap_or(usize::MAX) + 1;
+        if !out.is_empty() && total + sz > BUDGET {
+            break;
+        }
+        total += sz;
+        out.push(node);
+    }
+    out
+}
+
+/// Escape SQL LIKE metacharacters (`%`, `_`, and the `\` escape char itself)
+/// so a search query is matched literally rather than as a wildcard pattern.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\\' || c == '%' || c == '_' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn require_nonempty(s: &str, what: &str) -> Result<(), StoreError> {
     if s.trim().is_empty() {
         Err(StoreError::InvalidArg(format!("{what} must not be empty")))
@@ -635,17 +938,18 @@ fn require_nonempty(s: &str, what: &str) -> Result<(), StoreError> {
     }
 }
 
-/// Bring the database schema up to the current version.
+/// Bring the database schema up to the current version (`SCHEMA_VERSION`).
 ///
-/// - fresh DB: create `nodes` + root, stamp version 2.
+/// - fresh DB: create `nodes` + root + `vault` table, stamp version 3.
 /// - legacy v1 (flat `bookmarks` table): create `nodes` + root, copy bookmarks
 ///   in as children of root preserving created-order, drop `bookmarks`.
+/// - v2 (`nodes` only): additively create the `vault` table.
 ///
 /// Wrapped in one transaction so a crash leaves the prior version intact, and
 /// `user_version` makes it idempotent under concurrent `serve` processes.
 fn migrate(conn: &Connection) -> Result<(), StoreError> {
     // Cheap pre-check outside the lock to skip the common already-migrated case.
-    if conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? >= 2 {
+    if conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? >= SCHEMA_VERSION {
         return Ok(());
     }
 
@@ -655,10 +959,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
 
     // Re-read the version INSIDE the transaction. A concurrent process may have
-    // migrated (and dropped `bookmarks`) between the pre-check and acquiring the
-    // write lock; re-checking here makes the second process a clean no-op
-    // instead of running INSERT/DROP against a table that's already gone.
-    if tx.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? >= 2 {
+    // migrated between the pre-check and acquiring the write lock; re-checking
+    // here makes the second process a clean no-op.
+    if tx.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? >= SCHEMA_VERSION {
         return Ok(());
     }
     let has_bookmarks: bool = tx.query_row(
@@ -667,20 +970,32 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         |r| r.get::<_, i64>(0),
     )? > 0;
 
-    tx.execute_batch(SCHEMA)?;
+    // Idempotent CREATE IF NOT EXISTS for both tables covers fresh, v2→v3, and
+    // partially-migrated databases.
+    tx.execute_batch(NODES_SCHEMA)?;
+    tx.execute_batch(VAULT_SCHEMA)?;
 
-    let root_exists: bool = tx.query_row(
-        "SELECT count(*) FROM nodes WHERE parent_id IS NULL",
-        [],
-        |r| r.get::<_, i64>(0),
-    )? > 0;
-    if !root_exists {
-        tx.execute(
-            "INSERT INTO nodes (id, parent_id, kind, title, url, position, created, modified, hidden)
-             VALUES (1, NULL, 'folder', 'hecate', NULL, 0, ?1, ?1, 0)",
-            [now],
-        )?;
-    }
+    // Find the existing root, or create one. Do NOT hard-code id=1 for the
+    // insert: a corrupt/hand-edited DB could have no root yet already occupy
+    // id=1 with some other row, and `VALUES (1, ...)` would hit a UNIQUE
+    // violation and brick the store on every run. Let SQLite assign the id and
+    // read it back — the rest of the code finds the root by `parent_id IS NULL`,
+    // never by a hard-coded id, so any assigned id is fine. (Same "never wedge
+    // the store" posture as the malformed-legacy-row salvage below.)
+    let root_id: i64 = match tx
+        .query_row("SELECT id FROM nodes WHERE parent_id IS NULL", [], |r| r.get(0))
+        .optional()?
+    {
+        Some(id) => id,
+        None => {
+            tx.execute(
+                "INSERT INTO nodes (parent_id, kind, title, url, position, created, modified, hidden)
+                 VALUES (NULL, 'folder', 'hecate', NULL, 0, ?1, ?1, 0)",
+                [now],
+            )?;
+            tx.last_insert_rowid()
+        }
+    };
 
     if has_bookmarks {
         // Copy old flat bookmarks under root, preserving order; new ids (old
@@ -690,20 +1005,29 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         // the whole migration and brick the store on every retry. COALESCE a
         // bad row to a placeholder rather than failing hard — never lose data
         // we can salvage, and never wedge the store.
+        // Append after any children the root already has (normally none on the
+        // real v1 path, so base = 0; nonzero only on a hand-edited DB that has
+        // both a `nodes` tree and a leftover `bookmarks` table — append rather
+        // than collide on position 0).
+        let base: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM nodes WHERE parent_id = ?1",
+            [root_id],
+            |r| r.get(0),
+        )?;
         tx.execute(
             "INSERT INTO nodes (parent_id, kind, title, url, position, created, modified, hidden)
-             SELECT 1, 'bookmark',
+             SELECT ?1, 'bookmark',
                     COALESCE(NULLIF(title, ''), '(untitled)'),
                     COALESCE(url, ''),
-                    row_number() OVER (ORDER BY created, id) - 1,
+                    ?2 + row_number() OVER (ORDER BY created, id) - 1,
                     COALESCE(created, 0), COALESCE(created, 0), 0
              FROM bookmarks",
-            [],
+            (root_id, base),
         )?;
         tx.execute("DROP TABLE bookmarks", [])?;
     }
 
-    tx.pragma_update(None, "user_version", 2)?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
 }
@@ -845,6 +1169,26 @@ mod tests {
         assert_eq!(f_node.children[0].id, a);
         // root now has f(0), b(1) contiguous.
         assert!(t.children.iter().any(|n| n.id == b && n.position == 1));
+    }
+
+    #[test]
+    fn move_same_folder_excludes_then_inserts() {
+        // Documents the exact semantics the manager's drag-reorder math relies
+        // on: move_node removes the node from the destination ordering FIRST,
+        // then inserts at the given position. So for siblings [A,B,C,D], moving
+        // A to position 2 yields [B,C,A,D] — NOT [B,A,C,D]. The JS compensates
+        // for downward same-folder drags by decrementing the target index.
+        let s = mem_store();
+        let r = root(&s);
+        let a = s.create_bookmark(Some(r), "A", "https://a.example", 1).unwrap();
+        let b = s.create_bookmark(Some(r), "B", "https://b.example", 2).unwrap();
+        let c = s.create_bookmark(Some(r), "C", "https://c.example", 3).unwrap();
+        let d = s.create_bookmark(Some(r), "D", "https://d.example", 4).unwrap();
+        let _ = (b, c, d);
+        s.move_node(a, r, Some(2), 10).unwrap();
+        let t = s.tree(false).unwrap();
+        let order: Vec<&str> = t.children.iter().map(|n| n.title.as_str()).collect();
+        assert_eq!(order, vec!["B", "C", "A", "D"]);
     }
 
     #[test]
@@ -1180,6 +1524,67 @@ mod tests {
     }
 
     #[test]
+    fn migration_survives_missing_root_with_id1_occupied() {
+        // A corrupt/hand-edited DB at an older version with NO root row but with
+        // id=1 already taken by a non-root node must NOT brick on migrate: the
+        // root insert no longer hard-codes id=1 (which would UNIQUE-violate and
+        // abort every run). The root is seeded with an assigned id and found by
+        // `parent_id IS NULL`.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(NODES_SCHEMA).unwrap();
+        // Mimic external corruption (sqlite3 CLI, FKs off by default): a non-root
+        // node squatting on id=1 whose parent points nowhere, and no NULL-parent
+        // root, pre-v3.
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, parent_id, kind, title, url, position, created, modified, hidden)
+             VALUES (1, 99, 'bookmark', 'orphan', 'https://x', 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        // Must not error/brick.
+        migrate(&conn).unwrap();
+        // A real root now exists (with parent_id NULL), at some assigned id != 1.
+        let s = Store { conn };
+        let root = root_id(&s.conn).unwrap();
+        assert_ne!(root, 1);
+        assert_eq!(s.conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 3);
+    }
+
+    #[test]
+    fn legacy_copy_appends_after_existing_children() {
+        // A hand-edited DB with BOTH a populated `nodes` tree AND a leftover
+        // `bookmarks` table: the migrated legacy rows must append after the
+        // existing children, not collide on position 0.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(NODES_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, parent_id, kind, title, url, position, created, modified, hidden)
+             VALUES (1, NULL, 'folder', 'hecate', NULL, 0, 0, 0, 0),
+                    (2, 1, 'bookmark', 'existing', 'https://e', 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE bookmarks (
+                 id INTEGER PRIMARY KEY, parent_id INTEGER,
+                 title TEXT, url TEXT, created INTEGER);
+             INSERT INTO bookmarks (parent_id, title, url, created)
+                 VALUES (NULL, 'legacy1', 'https://l1', 1);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        migrate(&conn).unwrap();
+        let s = Store { conn };
+        let t = s.tree(false).unwrap();
+        let positions: Vec<i64> = t.children.iter().map(|n| n.position).collect();
+        // Contiguous, no collision: existing at 0, legacy appended at 1.
+        assert_eq!(positions, vec![0, 1]);
+        assert_eq!(t.children.iter().filter(|n| n.position == 0).count(), 1);
+    }
+
+    #[test]
     fn concurrent_legacy_migration_stress() {
         // Stress (not deterministic-teeth) check: many processes opening the
         // SAME legacy v1 DB at once must all succeed — exercises the real
@@ -1232,5 +1637,202 @@ mod tests {
         let s = Store::from_conn(Connection::open(&path).unwrap()).unwrap();
         assert_eq!(s.tree(false).unwrap().children.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn children_paginates() {
+        let s = mem_store();
+        let r = root(&s);
+        for i in 0..10 {
+            s.create_bookmark(Some(r), &format!("b{i}"), "https://x.example", i)
+                .unwrap();
+        }
+        let (page, total) = s.children(None, 3, 0).unwrap();
+        assert_eq!(total, 10);
+        assert_eq!(page.len(), 3);
+        // Stable position order: first page is positions 0,1,2.
+        assert_eq!(
+            page.iter().map(|n| n.position).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        // Offset slices correctly; last partial page.
+        let (page2, _) = s.children(None, 3, 9).unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].position, 9);
+        // Out-of-range offset → empty page, total still accurate.
+        let (empty, total2) = s.children(None, 3, 100).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(total2, 10);
+        // Limit is clamped, not honoured verbatim, but never errors.
+        let (big, _) = s.children(None, 999_999, 0).unwrap();
+        assert_eq!(big.len(), 10);
+    }
+
+    #[test]
+    fn search_matches_title_and_url_literally() {
+        let s = mem_store();
+        let r = root(&s);
+        s.create_bookmark(Some(r), "Rust lang", "https://rust-lang.org", 1).unwrap();
+        s.create_folder(Some(r), "Reading", 2).unwrap();
+        s.create_bookmark(Some(r), "fifty %off", "https://deals.example", 3).unwrap();
+
+        // Title substring, case-insensitive.
+        let hits = s.search("rust", 50).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Rust lang");
+        // URL substring.
+        assert_eq!(s.search("deals.example", 50).unwrap().len(), 1);
+        // Folder titles match too.
+        assert_eq!(s.search("read", 50).unwrap().len(), 1);
+        // `%` is a literal, not a wildcard: matches only the "fifty %off" row,
+        // not everything.
+        let pct = s.search("%off", 50).unwrap();
+        assert_eq!(pct.len(), 1);
+        assert_eq!(pct[0].title, "fifty %off");
+        // A high-entropy phrase that matches nothing → empty (the unlock
+        // fall-through relies on this).
+        assert!(s.search("correct horse battery staple xyzzy", 50).unwrap().is_empty());
+        // Empty query → empty, never the whole tree.
+        assert!(s.search("   ", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn children_page_is_byte_bounded() {
+        // 200 fat bookmarks (~8 KB title each) would serialize to ~1.6 MB and
+        // blow the native-messaging cap. The page must be byte-trimmed to fit,
+        // while `total` still reports the true count so paging advances.
+        let s = mem_store();
+        let r = root(&s);
+        let big = "x".repeat(8 * 1024);
+        for i in 0..200 {
+            s.create_bookmark(Some(r), &format!("{big}{i}"), "https://x.example", i)
+                .unwrap();
+        }
+        let (page, total) = s.children(None, 1000, 0).unwrap();
+        assert_eq!(total, 200, "total must be the true count");
+        assert!(page.len() < 200, "page must be trimmed below the full count");
+        assert!(!page.is_empty(), "must keep at least one node so paging advances");
+        // The serialized page comfortably fits the 1 MiB cap.
+        let bytes = serde_json::to_vec(&page).unwrap();
+        assert!(bytes.len() < 1024 * 1024, "page serialized to {} bytes", bytes.len());
+    }
+
+    #[test]
+    fn children_byte_budget_accounts_for_json_escaping() {
+        // A raw-length estimate is unsound: serde escapes a control byte to
+        // `\u00XX` (6x). Titles of control chars must still produce a page whose
+        // ACTUAL serialized size fits the cap — the trim measures real bytes.
+        let s = mem_store();
+        let r = root(&s);
+        // 4 KB of NUL bytes per title → ~24 KB serialized each (  = 6 bytes).
+        let ctrl = "\u{0}".repeat(4 * 1024);
+        for i in 0..1000 {
+            s.create_bookmark(Some(r), &format!("{ctrl}{i}"), "https://x.example", i)
+                .unwrap();
+        }
+        let (page, total) = s.children(None, 1000, 0).unwrap();
+        assert_eq!(total, 1000);
+        assert!(!page.is_empty());
+        let bytes = serde_json::to_vec(&page).unwrap();
+        assert!(
+            bytes.len() < 1024 * 1024,
+            "escaped page serialized to {} bytes — over the cap",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn children_keeps_one_oversize_node() {
+        // A single node larger than the byte budget is still returned (the
+        // accepted "giant single node" case) so the folder isn't un-openable.
+        let s = mem_store();
+        let r = root(&s);
+        let huge = "y".repeat(900 * 1024);
+        s.create_bookmark(Some(r), &huge, "https://x.example", 1).unwrap();
+        let (page, total) = s.children(None, 1000, 0).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(page.len(), 1);
+    }
+
+    #[test]
+    fn children_only_direct() {
+        // children() returns one level, not the whole subtree.
+        let s = mem_store();
+        let r = root(&s);
+        let f = s.create_folder(Some(r), "f", 1).unwrap();
+        s.create_bookmark(Some(f), "deep", "https://d.example", 2).unwrap();
+        let (page, total) = s.children(Some(r), 200, 0).unwrap();
+        assert_eq!(total, 1); // just `f`, not `deep`
+        assert_eq!(page[0].title, "f");
+        assert!(page[0].children.is_empty()); // flat, no nested grandchildren
+    }
+
+    #[test]
+    fn from_vault_rows_roundtrips_and_rejects_corruption() {
+        // A clean flat row set loads and dumps back identically.
+        let rows = vec![
+            NodeRow { id: 1, parent_id: None, kind: NodeKind::Folder, title: "Hidden".into(), url: None, position: 0, created: 0, modified: 0 },
+            NodeRow { id: 2, parent_id: Some(1), kind: NodeKind::Bookmark, title: "b".into(), url: Some("https://b.example".into()), position: 0, created: 0, modified: 0 },
+        ];
+        let s = Store::from_vault_rows(Connection::open_in_memory().unwrap(), &rows).unwrap();
+        assert_eq!(s.tree(true).unwrap().children.len(), 1);
+        assert_eq!(s.dump_rows().unwrap().len(), 2);
+
+        // No root → corrupt.
+        let no_root = vec![NodeRow { id: 2, parent_id: Some(1), kind: NodeKind::Bookmark, title: "x".into(), url: Some("https://x".into()), position: 0, created: 0, modified: 0 }];
+        assert!(matches!(
+            Store::from_vault_rows(Connection::open_in_memory().unwrap(), &no_root),
+            Err(StoreError::CorruptVault(_))
+        ));
+
+        // Dangling parent (unreachable node) → corrupt, not silently dropped.
+        let dangling = vec![
+            NodeRow { id: 1, parent_id: None, kind: NodeKind::Folder, title: "Hidden".into(), url: None, position: 0, created: 0, modified: 0 },
+            NodeRow { id: 2, parent_id: Some(999), kind: NodeKind::Bookmark, title: "orphan".into(), url: Some("https://o".into()), position: 0, created: 0, modified: 0 },
+        ];
+        assert!(matches!(
+            Store::from_vault_rows(Connection::open_in_memory().unwrap(), &dangling),
+            Err(StoreError::CorruptVault(_))
+        ));
+
+        // Two roots → corrupt.
+        let two_roots = vec![
+            NodeRow { id: 1, parent_id: None, kind: NodeKind::Folder, title: "A".into(), url: None, position: 0, created: 0, modified: 0 },
+            NodeRow { id: 2, parent_id: None, kind: NodeKind::Folder, title: "B".into(), url: None, position: 0, created: 0, modified: 0 },
+        ];
+        assert!(matches!(
+            Store::from_vault_rows(Connection::open_in_memory().unwrap(), &two_roots),
+            Err(StoreError::CorruptVault(_))
+        ));
+
+        // Over-deep chain → CorruptVault (NOT MaxDepthExceeded): every
+        // structural failure in a decrypted blob must normalize to one corrupt
+        // class so the caller never re-persists it.
+        let mut deep = vec![NodeRow { id: 1, parent_id: None, kind: NodeKind::Folder, title: "Hidden".into(), url: None, position: 0, created: 0, modified: 0 }];
+        for i in 0..(MAX_DEPTH + 5) {
+            deep.push(NodeRow { id: i + 2, parent_id: Some(i + 1), kind: NodeKind::Folder, title: format!("d{i}"), url: None, position: 0, created: 0, modified: 0 });
+        }
+        assert!(matches!(
+            Store::from_vault_rows(Connection::open_in_memory().unwrap(), &deep),
+            Err(StoreError::CorruptVault(_))
+        ));
+
+        // Duplicate id → CorruptVault, not a raw Sqlite UNIQUE error.
+        let dup = vec![
+            NodeRow { id: 1, parent_id: None, kind: NodeKind::Folder, title: "Hidden".into(), url: None, position: 0, created: 0, modified: 0 },
+            NodeRow { id: 2, parent_id: Some(1), kind: NodeKind::Bookmark, title: "a".into(), url: Some("https://a".into()), position: 0, created: 0, modified: 0 },
+            NodeRow { id: 2, parent_id: Some(1), kind: NodeKind::Bookmark, title: "b".into(), url: Some("https://b".into()), position: 1, created: 0, modified: 0 },
+        ];
+        assert!(matches!(
+            Store::from_vault_rows(Connection::open_in_memory().unwrap(), &dup),
+            Err(StoreError::CorruptVault(_))
+        ));
+
+        // A bookmark as the root → CorruptVault (root must be a folder).
+        let bm_root = vec![NodeRow { id: 1, parent_id: None, kind: NodeKind::Bookmark, title: "x".into(), url: Some("https://x".into()), position: 0, created: 0, modified: 0 }];
+        assert!(matches!(
+            Store::from_vault_rows(Connection::open_in_memory().unwrap(), &bm_root),
+            Err(StoreError::CorruptVault(_))
+        ));
     }
 }

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "hecate",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "hecate — cross-browser bookmark manager (thin client for the local native app)",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0kMwZU2QFQ41J2xHHs0HHinoi1XZyK2432syDV4yJr5dHYnKdWdfsCi0dRTQ2iEiGwzOSDNqon+npaR4irsi5rS+1g4YdSvTeIxYG/Hp61TEA0hDdCXgys1/mDSrj3nGyj4XNrQX8VWB57j0m+2Em2jIVeEUwnnj+fQ2eU2drKEbcSssMuHvpdqs2KVR3o/I4zuFYL7c8i4wEXOX72it5owxE7uLIDWZPhg1tEL9DoJeIzV5xKIc07scve7aQGCx6GydE+/E0nHXK3FZtHjAB/L8OIgPC3hJT6SE0zums8R/mEXzYV2QJKA/SkzDBR41DDnG0fidVuAt7zRMPupyFwIDAQAB",
   "permissions": ["nativeMessaging", "tabs", "contextMenus", "storage"],
